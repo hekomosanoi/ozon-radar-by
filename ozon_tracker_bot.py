@@ -1,21 +1,21 @@
 import asyncio
 import logging
+import os
 import re
 import sqlite3
-from typing import List, Optional, Tuple
+from typing import List, Optional
 from urllib.parse import quote_plus
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
+from aiohttp import web
 from playwright.async_api import BrowserContext, async_playwright
 
-# ---------------------------------------------------------
-# КОНФИГУРАЦИЯ БОТА
-# ---------------------------------------------------------
-BOT_TOKEN = "8762026289:AAHZ-eUqKIjfuYgZU_V5bv51WcXsyob8DF4"  # Вставьте сюда токен вашего Telegram-бота
-ADMIN_CHAT_ID = 7805601948  # Ваш Telegram ID (чтобы бот слал находки только вам)
-CHECK_INTERVAL_SECONDS = 300  # Интервал сканирования (300 сек = 5 минут)
+BOT_TOKEN = "8762026289:AAHZ-eUqKIjfuYgZU_V5bv51WcXsyob8DF4"
+ADMIN_CHAT_ID = 7805601948
+# Быстрый интервал сканирования: 45 секунд между кругами
+CHECK_INTERVAL_SECONDS = 45
 DB_PATH = "ozon_radar.db"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -30,7 +30,6 @@ def init_database():
     """Создает таблицы для хранения задач и истории отправленных товаров."""
     with get_db() as conn:
         cursor = conn.cursor()
-        # Таблица для мониторинга: ключевое слово или готовая ссылка Ozon
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS radar_tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,7 +41,6 @@ def init_database():
                 is_active INTEGER DEFAULT 1
             )
         """)
-        # Таблица для дедупликации (чтобы один товар не присылался дважды)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS sent_products (
                 product_id TEXT PRIMARY KEY,
@@ -94,10 +92,8 @@ def record_sent_product(product_id: str, task_id: int, title: str, price: float)
         conn.commit()
 
 def extract_price(text: str) -> Optional[float]:
-    """Извлекает числовую цену в BYN из текстового блока карточки."""
-    # Нормализуем неразрывные пробелы и переносы
+    """Извлекает цену в BYN из текстовых блоков Ozon."""
     clean = text.replace("\xa0", " ").replace("&nbsp;", " ")
-    # Регулярка ловит шаблоны: 7,50 р., 15.99 BYN, 18 р, 1 200 р.
     match = re.search(r"(\d+(?:[\s\u00A0]\d+)*[.,]?\d*)\s*(?:р\.|BYN|руб)", clean, re.IGNORECASE)
     if match:
         raw_price = match.group(1).replace(" ", "").replace(",", ".")
@@ -108,38 +104,40 @@ def extract_price(text: str) -> Optional[float]:
     return None
 
 async def parse_ozon_page(context: BrowserContext, target: str) -> List[dict]:
-    """
-    Открывает поисковый запрос или готовую ссылку Ozon.by и извлекает карточки.
-    """
     if target.startswith("http://") or target.startswith("https://"):
         url = target
     else:
-        # Если передано слово — строим поисковую ссылку с сортировкой по возрастанию цены
         encoded_query = quote_plus(target)
         url = f"https://www.ozon.by/search/?from_global=true&sorting=price&text={encoded_query}"
 
     page = await context.new_page()
+    
+    # ТУРБО-РЕЖИМ: Блокируем картинки, медиа и рекламу для мгновенной загрузки
+    await page.route(
+        "**/*",
+        lambda route: route.abort() if route.request.resource_type in ["image", "media", "font"]
+        or "google-analytics" in route.request.url
+        or "yandex" in route.request.url
+        else route.continue_()
+    )
+
     items = []
 
     try:
-        logger.info(f"Загружаем страницу: {url}")
-        await page.goto(url, wait_until="domcontentloaded", timeout=50000)
-        # Ждем подгрузки карточек Ozon и эмулируем легкий скролл
-        await page.wait_for_timeout(3500)
-        await page.evaluate("window.scrollBy(0, 400)")
-        await page.wait_for_timeout(1500)
+        # domcontentloaded вместо networkidle для молниеносного ответа
+        await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+        await page.wait_for_timeout(1200)
+        await page.evaluate("window.scrollBy(0, 500)")
+        await page.wait_for_timeout(800)
 
-        # Универсальный поиск: берем карточки товаров или контейнеры со ссылками на товары
         cards = await page.query_selector_all("div[data-widget='searchResultsV2'] > div > div, div[class*='tile']")
         if not cards:
             cards = await page.query_selector_all("div[class*='tile'][data-index]")
 
         seen_ids = set()
 
-        for card in cards[:35]:  # Берем первые предложения
+        for card in cards[:35]:
             raw_text = await card.inner_text()
-            
-            # Пропускаем товары, недоступные для доставки в Беларусь
             if "не доставляется" in raw_text.lower():
                 continue
 
@@ -161,11 +159,9 @@ async def parse_ozon_page(context: BrowserContext, target: str) -> List[dict]:
 
             clean_url = f"https://www.ozon.by/product/{product_id}/"
 
-            # Извлекаем заголовок
             title_elem = await card.query_selector("span.tsBody500Medium, span[class*='title'], span.tsBodyL")
             title = (await title_elem.inner_text()).strip() if title_elem else "Товар Ozon"
 
-            # Извлекаем цену
             price = extract_price(raw_text)
             if price is not None:
                 items.append({
@@ -183,11 +179,9 @@ async def parse_ozon_page(context: BrowserContext, target: str) -> List[dict]:
     return items
 
 async def background_radar_worker(bot: Bot):
-    """Фоновый цикл проверки всех сохраненных радаров."""
-    logger.info("Фоновый воркер радара запущен.")
+    logger.info("Фоновый турбо-воркер радара запущен.")
     
     async with async_playwright() as p:
-        # Важно для облака (Render/Linux): флаги песочницы для избежания крашей
         browser = await p.chromium.launch(
             headless=True,
             args=[
@@ -206,8 +200,7 @@ async def background_radar_worker(bot: Bot):
         while True:
             tasks = get_active_tasks()
             if not tasks:
-                logger.info("Список радаров пуст. Ожидание задач...")
-                await asyncio.sleep(30)
+                await asyncio.sleep(15)
                 continue
 
             for task in tasks:
@@ -219,8 +212,14 @@ async def background_radar_worker(bot: Bot):
                 raw_stop_words = task["stop_words"] or ""
                 stop_words = [w.strip().lower() for w in raw_stop_words.split(",") if w.strip()]
 
-                logger.info(f"Проверка радара #{t_id} [{t_title}] диапазон {min_p} - {max_p} BYN...")
                 found_products = await parse_ozon_page(context, t_target)
+                
+                # Логируем минимальную цену в каталоге для наглядности
+                if found_products:
+                    lowest_now = min(p["price"] for p in found_products)
+                    logger.info(f"🔎 [{t_title}] Найдено {len(found_products)} шт. Самая низкая цена: {lowest_now:.2f} BYN (Ваш фильтр: {min_p}–{max_p} BYN)")
+                else:
+                    logger.info(f"🔎 [{t_title}] Карточки пока не распознаны Ozon.")
 
                 for item in found_products:
                     p_id = item["id"]
@@ -228,28 +227,23 @@ async def background_radar_worker(bot: Bot):
                     p_title = item["title"]
                     p_url = item["url"]
 
-                    # 1. Проверяем, не отправляли ли мы этот товар ранее
                     if is_product_sent(p_id):
                         continue
 
-                    # 2. Проверяем стоп-слова
                     lower_title = p_title.lower()
                     if any(sw in lower_title for sw in stop_words):
                         continue
 
-                    # 3. Проверяем индивидуальную вилку цен (min_p <= price <= max_p)
                     if min_p <= price <= max_p:
-                        # Фиксируем отправку
                         record_sent_product(p_id, t_id, p_title, price)
 
-                        # Сообщение в единый чат со ссылкой именно на этот товар
                         msg = (
-                            f"🎯 <b>НАХОДКА В ВАШЕМ ДИАПАЗОНЕ!</b>\n\n"
+                            f"⚡️ <b>СВЕЖАЯ НАХОДКА!</b>\n\n"
                             f"📌 <b>Радар:</b> {t_title}\n"
                             f"📦 <b>Товар:</b> {p_title}\n"
                             f"💰 <b>Цена:</b> <code>{price:.2f} BYN</code> (в вилке {min_p}–{max_p} BYN)\n"
                             f"🚚 <b>Доставка:</b> Доступно для Ozon Беларусь\n\n"
-                            f"👉 <a href='{p_url}'>Перейти к товару на Ozon.by</a>"
+                            f"👉 <a href='{p_url}'>Купить на Ozon.by прямо сейчас</a>"
                         )
 
                         if ADMIN_CHAT_ID != 0:
@@ -260,14 +254,26 @@ async def background_radar_worker(bot: Bot):
                                     parse_mode="HTML",
                                     disable_web_page_preview=False
                                 )
+                                logger.info(f"Уведомление отправлено в чат по товару #{p_id}")
                             except Exception as err:
                                 logger.error(f"Не удалось отправить уведомление: {err}")
 
-                # Пауза между разными ссылками/запросами
-                await asyncio.sleep(5)
+                await asyncio.sleep(2)
 
-            # Ожидание перед следующим кругом
             await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+
+async def start_web_server():
+    async def handle_ping(request):
+        return web.Response(text="Ozon Radar Bot is running (Live)!")
+
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Веб-сервер ответа Render запущен на порту {port}")
 
 dp = Dispatcher()
 
@@ -276,38 +282,26 @@ async def cmd_start(message: Message):
     chat_id = message.chat.id
     help_text = (
         f"👋 <b>Добро пожаловать в Ozon Deal Radar (Беларусь)!</b>\n\n"
-        f"Ваш Chat ID: <code>{chat_id}</code>\n"
-        f"<i>(Укажите его в коде бота в переменной ADMIN_CHAT_ID, чтобы получать находки)</i>\n\n"
-        f"<b>Как добавить товар на слежение:</b>\n"
-        f"Каждый радар имеет свой индивидуальный диапазон цен!\n\n"
+        f"Ваш Chat ID: <code>{chat_id}</code>\n\n"
+        f"<b>Как добавить товар на скоростной мониторинг:</b>\n\n"
         f"🔹 <b>По слову:</b>\n"
-        f"<code>/add Гирлянда 5 9 крючки,батарейка,удлинитель</code>\n"
-        f"<i>(Будут искаться гирлянды строго от 5 до 9 BYN)</i>\n\n"
-        f"🔹 <b>Для другого товара с другим диапазоном:</b>\n"
-        f"<code>/add Наушники 15 35 чехол,провод,насадки</code>\n"
-        f"<i>(Будут искаться наушники строго от 15 до 35 BYN)</i>\n\n"
+        f"<code>/add Гирлянда 5 9 крючки,батарейка,удлинитель</code>\n\n"
         f"🔹 <b>По готовой ссылке с Ozon:</b>\n"
         f"<code>/add Смартфон_Скидки https://ozon.by/category/... 100 250 чехол,стекло</code>\n\n"
         f"<b>Другие команды:</b>\n"
-        f"/list — список всех активных радаров\n"
+        f"/list — список активных радаров\n"
         f"/del [ID] — удалить радар"
     )
     await message.answer(help_text, parse_mode="HTML")
 
 @dp.message(Command("add"))
 async def cmd_add(message: Message):
-    """
-    Формат команды:
-    /add <Название_или_Ссылка> <мин_цена> <макс_цена> [стоп-слова через запятую]
-    """
     parts = message.text.split(maxsplit=4)
     if len(parts) < 4:
         await message.answer(
             "⚠️ <b>Неверный формат команды!</b>\n\n"
             "Пример:\n"
-            "<code>/add Гирлянда 5 9 крючки,батарейка</code>\n"
-            "или\n"
-            "<code>/add Наушники 15 30 чехол,кабель</code>",
+            "<code>/add Гирлянда 5 9 крючки,батарейка</code>",
             parse_mode="HTML"
         )
         return
@@ -326,11 +320,11 @@ async def cmd_add(message: Message):
     task_id = add_radar_task(title, target, min_p, max_p, stop_words)
 
     response = (
-        f"✅ <b>Радар #{task_id} успешно добавлен!</b>\n\n"
+        f"✅ <b>Радар #{task_id} добавлен в скоростной мониторинг!</b>\n\n"
         f"🎯 <b>Цель:</b> {target}\n"
-        f"📊 <b>Индивидуальный диапазон:</b> от <code>{min_p:.2f}</code> до <code>{max_p:.2f} BYN</code>\n"
+        f"📊 <b>Диапазон:</b> от <code>{min_p:.2f}</code> до <code>{max_p:.2f} BYN</code>\n"
         f"🚫 <b>Стоп-слова:</b> {stop_words if stop_words else 'нет'}\n\n"
-        f"<i>Бот начнет проверку в ближайшем цикле и пришлет прямую ссылку на товар при обнаружении цены в этом окне.</i>"
+        f"<i>Интервал проверки: ~45 секунд. Ссылка придет моментально при появлении товара!</i>"
     )
     await message.answer(response, parse_mode="HTML")
 
@@ -366,9 +360,13 @@ async def main():
     init_database()
     bot = Bot(token=BOT_TOKEN)
 
-    # Запускаем фоновый парсер в параллельной задаче
+    # 1. Запуск встроенного веб-сервера для Render (зеленый статус Live)
+    await start_web_server()
+
+    # 2. Фоновый скоростной сканер Ozon
     asyncio.create_task(background_radar_worker(bot))
 
+    # 3. Слушатель сообщений Telegram
     logger.info("Запуск Telegram-бота...")
     await dp.start_polling(bot)
 
