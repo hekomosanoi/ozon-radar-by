@@ -79,7 +79,6 @@ VALUES (?, ?, ?, ?)
 """, (product_id, task_id, title, price))
 conn.commit()
 ​def extract_price(text: str) -> Optional[float]:
-"""Извлекает цену в BYN из текстовых блоков Ozon."""
 clean = text.replace("\xa0", " ").replace(" ", " ")
 match = re.search(r"(\d+(?:[\s\u00A0]\d+)[.,]?\d)\s*(?:р.|BYN|руб)", clean, re.IGNORECASE)
 if match:
@@ -98,17 +97,13 @@ url = f"https://www.ozon.by/search/?from_global=true&sorting=price&text={encoded
 ​page = await context.new_page()
 items = []
 ​try:
-# Даем странице полноценно загрузиться и подгрузить JavaScript
 await page.goto(url, wait_until="load", timeout=35000)
-​# Получаем заголовок страницы для диагностики
 page_title = await page.title()
-logger.info(f"🌐 Страница открыта: '{page_title}' | URL: {url[:70]}...")
-​# Даем 3.5 секунды на выполнение клиентских скриптов каталога Ozon
-await page.wait_for_timeout(3500)
-await page.evaluate("window.scrollBy(0, 600)")
+logger.info(f"Ozon ответ: '{page_title}'")
+​await page.wait_for_timeout(3500)
+await page.evaluate("window.scrollBy(0, 500)")
 await page.wait_for_timeout(1500)
-​# 1. Ищем все ссылки на товары прямо в DOM
-links = await page.query_selector_all("a[href*='/product/']")
+​links = await page.query_selector_all("a[href*='/product/']")
 seen_ids = set()
 ​for link in links:
 href = await link.get_attribute("href") or ""
@@ -119,8 +114,7 @@ continue
 if product_id in seen_ids:
 continue
 seen_ids.add(product_id)
-​# Берем родительский блок карточки
-card = await link.evaluate_handle("el => el.closest('div[class*="tile"]') || el.parentElement.parentElement")
+​card = await link.evaluate_handle("el => el.closest('div[class*="tile"]') || el.parentElement.parentElement")
 if not card:
 continue
 ​raw_text = await card.as_element().inner_text() if card.as_element() else ""
@@ -129,8 +123,7 @@ continue
 ​price = extract_price(raw_text)
 if price is None:
 continue
-​# Ищем название товара внутри карточки
-title_elem = await card.as_element().query_selector("span.tsBody500Medium, span[class*='title'], span.tsBodyL")
+​title_elem = await card.as_element().query_selector("span.tsBody500Medium, span[class*='title'], span.tsBodyL")
 title = (await title_elem.inner_text()).strip() if title_elem else "Товар Ozon"
 ​clean_url = f"https://www.ozon.by/product/{product_id}/"
 items.append({
@@ -180,9 +173,9 @@ stop_words = [w.strip().lower() for w in raw_stop_words.split(",") if w.strip()]
 ​found_products = await parse_ozon_page(context, t_target)
 ​if found_products:
 lowest_now = min(p["price"] for p in found_products)
-logger.info(f"🔎 [{t_title}] Найдено {len(found_products)} шт. Самая низкая цена: {lowest_now:.2f} BYN (Ваш фильтр: {min_p}–{max_p} BYN)")
+logger.info(f"Найдено {len(found_products)} шт. Самая низкая цена: {lowest_now:.2f} BYN (фильтр: {min_p}–{max_p} BYN)")
 else:
-logger.info(f"🔎 [{t_title}] Карточки пока не распознаны Ozon.")
+logger.info(f"[{t_title}] Карточки не найдены на этой итерации.")
 ​for item in found_products:
 p_id = item["id"]
 price = item["price"]
@@ -196,7 +189,7 @@ continue
 ​if min_p <= price <= max_p:
 record_sent_product(p_id, t_id, p_title, price)
 ​msg = (
-f"⚡️ <b>СВЕЖАЯ НАХОДКА!</b>\n\n"
+f"⚡️️ <b>СВЕЖАЯ НАХОДКА!</b>\n\n"
 f"📌 <b>Радар:</b> {t_title}\n"
 f"📦 <b>Товар:</b> {p_title}\n"
 f"💰 <b>Цена:</b> <code>{price:.2f} BYN</code> (в вилке {min_p}–{max_p} BYN)\n"
