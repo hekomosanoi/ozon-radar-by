@@ -95,10 +95,12 @@ def record_sent_product(product_id: str, task_id: int, title: str, price: float)
 
 def extract_price(text: str) -> Optional[float]:
     """Извлекает числовую цену в BYN из текстового блока карточки."""
-    # Регулярка ловит шаблоны: 7,50 р., 15.99 BYN, 18 р
-    match = re.search(r"(\d+[\.,]?\d*)\s*(?:р\.|BYN|руб)", text, re.IGNORECASE)
+    # Нормализуем неразрывные пробелы и переносы
+    clean = text.replace("\xa0", " ").replace("&nbsp;", " ")
+    # Регулярка ловит шаблоны: 7,50 р., 15.99 BYN, 18 р, 1 200 р.
+    match = re.search(r"(\d+(?:[\s\u00A0]\d+)*[.,]?\d*)\s*(?:р\.|BYN|руб)", clean, re.IGNORECASE)
     if match:
-        raw_price = match.group(1).replace(",", ".").replace(" ", "")
+        raw_price = match.group(1).replace(" ", "").replace(",", ".")
         try:
             return float(raw_price)
         except ValueError:
@@ -121,16 +123,20 @@ async def parse_ozon_page(context: BrowserContext, target: str) -> List[dict]:
 
     try:
         logger.info(f"Загружаем страницу: {url}")
-        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        # Ждем подгрузки карточек Ozon
+        await page.goto(url, wait_until="domcontentloaded", timeout=50000)
+        # Ждем подгрузки карточек Ozon и эмулируем легкий скролл
         await page.wait_for_timeout(3500)
+        await page.evaluate("window.scrollBy(0, 400)")
+        await page.wait_for_timeout(1500)
 
-        # Селекторы карточек Ozon
-        cards = await page.query_selector_all("div[data-widget='searchResultsV2'] div[class*='tile']")
+        # Универсальный поиск: берем карточки товаров или контейнеры со ссылками на товары
+        cards = await page.query_selector_all("div[data-widget='searchResultsV2'] > div > div, div[class*='tile']")
         if not cards:
             cards = await page.query_selector_all("div[class*='tile'][data-index]")
 
-        for card in cards[:30]:  # Берем первые 30 самых дешевых предложений
+        seen_ids = set()
+
+        for card in cards[:35]:  # Берем первые предложения
             raw_text = await card.inner_text()
             
             # Пропускаем товары, недоступные для доставки в Беларусь
@@ -149,10 +155,14 @@ async def parse_ozon_page(context: BrowserContext, target: str) -> List[dict]:
                 continue
 
             product_id = match.group(1)
+            if product_id in seen_ids:
+                continue
+            seen_ids.add(product_id)
+
             clean_url = f"https://www.ozon.by/product/{product_id}/"
 
             # Извлекаем заголовок
-            title_elem = await card.query_selector("span.tsBody500Medium, span[class*='title']")
+            title_elem = await card.query_selector("span.tsBody500Medium, span[class*='title'], span.tsBodyL")
             title = (await title_elem.inner_text()).strip() if title_elem else "Товар Ozon"
 
             # Извлекаем цену
@@ -177,10 +187,18 @@ async def background_radar_worker(bot: Bot):
     logger.info("Фоновый воркер радара запущен.")
     
     async with async_playwright() as p:
-        # Запускаем браузер с реалистичным отпечатком
-        browser = await p.chromium.launch(headless=True)
+        # Важно для облака (Render/Linux): флаги песочницы для избежания крашей
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled"
+            ]
+        )
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             locale="ru-BY",
             viewport={"width": 1280, "height": 800}
         )
