@@ -13,7 +13,7 @@ from playwright.async_api import BrowserContext, async_playwright
 # ---------------------------------------------------------
 # КОНФИГУРАЦИЯ БОТА
 # ---------------------------------------------------------
-BOT_TOKEN = "ВАШ_ТОКЕН_ОТ_BOTFATHER"  # Вставьте сюда токен вашего Telegram-бота
+BOT_TOKEN = "8762026289:AAHZ-eUqKIjfuYgZU_V5bv51WcXsyob8DF4"  # Вставьте сюда токен вашего Telegram-бота
 ADMIN_CHAT_ID = 0  # Ваш Telegram ID (чтобы бот слал находки только вам)
 CHECK_INTERVAL_SECONDS = 300  # Интервал сканирования (300 сек = 5 минут)
 DB_PATH = "ozon_radar.db"
